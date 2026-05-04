@@ -1,0 +1,217 @@
+{
+  "project_name": "Silent Signal",
+  "app_type": "mobile_web_app",
+  "theme": "dark",
+  "archetype": "Tactical Privacy",
+  "brand": {
+    "name": "Silent Signal",
+    "tagline": "Encrypted. Private. Yours."
+  },
+  "colors": {
+    "background": "#111111",
+    "surface": "#1A1A1A",
+    "primary": "#4ADE80",
+    "border": "#2D4A3E",
+    "text_primary": "#F4F4F5",
+    "text_muted": "#8A9A84",
+    "text_secondary_muted": "#A8A39A"
+  },
+  "typography": {
+    "font_family_primary": "System",
+    "font_family_monospace": "monospace",
+    "scales": {
+      "hero_title": { "fontSize": 40, "fontWeight": "800", "color": "#F4F4F5", "letterSpacing": -1 },
+      "h1": { "fontSize": 32, "fontWeight": "700", "color": "#F4F4F5", "letterSpacing": -0.5 },
+      "h2": { "fontSize": 24, "fontWeight": "600", "color": "#F4F4F5" },
+      "h3": { "fontSize": 18, "fontWeight": "600", "color": "#F4F4F5" },
+      "body": { "fontSize": 16, "fontWeight": "400", "color": "#F4F4F5" },
+      "body_muted": { "fontSize": 14, "fontWeight": "400", "color": "#8A9A84" },
+      "timestamp_mono": { "fontSize": 12, "fontFamily": "monospace", "fontWeight": "500", "color": "#A8A39A" },
+      "security_badge": { "fontSize": 10, "fontFamily": "monospace", "fontWeight": "700", "color": "#4ADE80", "textTransform": "uppercase", "letterSpacing": 1 }
+    }
+  },
+  "spacing": {
+    "xs": 4,
+    "sm": 8,
+    "md": 16,
+    "lg": 24,
+    "xl": 32,
+    "xxl": 48
+  },
+  "border_radius": {
+    "sm": 8,
+    "md": 12,
+    "lg": 16,
+    "xl": 24,
+    "pill": 9999
+  },
+  "components": {
+    "screen_container": {
+      "backgroundColor": "#111111",
+      "flex": 1,
+      "paddingHorizontal": 24
+    },
+    "surface_card": {
+      "backgroundColor": "#1A1A1A",
+      "borderColor": "#2D4A3E",
+      "borderWidth": 1,
+      "borderRadius": 16,
+      "padding": 16
+    },
+    "buttons": {
+      "primary": {
+        "backgroundColor": "#4ADE80",
+        "borderRadius": 9999,
+        "paddingVertical": 16,
+        "paddingHorizontal": 24,
+        "alignItems": "center",
+        "justifyContent": "center"
+      },
+      "primary_text": {
+        "color": "#111111",
+        "fontSize": 16,
+        "fontWeight": "700"
+      },
+      "secondary": {
+        "backgroundColor": "transparent",
+        "borderColor": "#2D4A3E",
+        "borderWidth": 1,
+        "borderRadius": 9999,
+        "paddingVertical": 16,
+        "paddingHorizontal": 24,
+        "alignItems": "center",
+        "justifyContent": "center"
+      },
+      "secondary_text": {
+        "color": "#F4F4F5",
+        "fontSize": 16,
+        "fontWeight": "600"
+      },
+      "icon_button": {
+        "backgroundColor": "#1A1A1A",
+        "borderColor": "#2D4A3E",
+        "borderWidth": 1,
+        "borderRadius": 9999,
+        "padding": 12,
+        "alignItems": "center",
+        "justifyContent": "center"
+      }
+    },
+    "inputs": {
+      "default": {
+        "backgroundColor": "#111111",
+        "borderColor": "#2D4A3E",
+        "borderWidth": 1,
+        "borderRadius": 12,
+        "padding": 16,
+        "color": "#F4F4F5",
+        "fontSize": 16
+      },
+      "focused": {
+        "borderColor": "#4ADE80",
+        "borderWidth": 1
+      },
+      "placeholderTextColor": "#8A9A84"
+    },
+    "chat_bubbles": {
+      "sent": {
+        "backgroundColor": "#2D4A3E",
+        "borderTopLeftRadius": 20,
+        "borderTopRightRadius": 20,
+        "borderBottomLeftRadius": 20,
+        "borderBottomRightRadius": 4,
+        "padding": 12,
+        "maxWidth": "80%"
+      },
+      "received": {
+        "backgroundColor": "#1A1A1A",
+        "borderColor": "#2D4A3E",
+        "borderWidth": 1,
+        "borderTopLeftRadius": 20,
+        "borderTopRightRadius": 20,
+        "borderBottomRightRadius": 20,
+        "borderBottomLeftRadius": 4,
+        "padding": 12,
+        "maxWidth": "80%"
+      }
+    },
+    "bottom_sheet_modal": {
+      "backgroundColor": "#1A1A1A",
+      "borderTopLeftRadius": 24,
+      "borderTopRightRadius": 24,
+      "borderTopWidth": 1,
+      "borderTopColor": "#2D4A3E",
+      "padding": 24,
+      "paddingBottom": 48
+    }
+  },
+  "screens": {
+    "landing": {
+      "layout": "Flex container with centered content, wrapped in SafeAreaView.",
+      "visuals": "Implement an ASCII-wave background using Expo Canvas or Skia, falling back to a looping dark green pattern video/gif if heavy. Large logo with lock icon.",
+      "typography": "Headline 'Encrypted. Private. Yours.' prominent in center.",
+      "cta": "Primary 'Get Started' and Secondary 'Log In' buttons at bottom."
+    },
+    "auth": {
+      "layout": "KeyboardAvoidingView container with scrollable content.",
+      "visuals": "Header containing a subtle #4ADE80 Lock icon.",
+      "forms": "Email, Password inputs. Use secureTextEntry for password."
+    },
+    "dashboard": {
+      "navigation": "Bottom Tab Navigator (Chats, Friends) with background #111111, borderTop #2D4A3E, active tint #4ADE80.",
+      "header": "Left: 'Silent Signal' branding. Right: Search & Profile icon buttons.",
+      "chats_tab": {
+        "item_layout": "Row with Avatar (left), Name & Preview (middle), Timestamp & Unread Indicator (right).",
+        "preview_text": "If encrypted, show a placeholder like '[Encrypted Message]' in muted text with a tiny lock icon.",
+        "timestamp": "Monospace, text_secondary_muted."
+      },
+      "friends_tab": {
+        "layout": "Top section for 'Pending Requests', bottom section for 'Friends List'.",
+        "item_layout": "Row with Avatar, Name, and Accept/Decline icon buttons."
+      }
+    },
+    "chat_room": {
+      "layout": "SafeAreaView. Header, scrollable message list, anchored input bar.",
+      "header": "Title: Contact Name. Subtitle: Monospace 'E2E ENCRYPTED' (#4ADE80) with lock icon. Right action: Vanishing Message toggle.",
+      "message_list": "Inverted flatlist or flex-end layout. Display monospace timestamps under messages.",
+      "input_bar": "Container (#1A1A1A) with borderTop (#2D4A3E). TextInput rounded, Send button (#4ADE80).",
+      "group_features": "If group chat, include a 'Copy Invite Code' button in header or settings sheet."
+    }
+  },
+  "icons": {
+    "provider": "@expo/vector-icons",
+    "family": "Feather",
+    "mapping": {
+      "lock": "lock (security, E2E)",
+      "send": "send (chat input)",
+      "user": "user (profile)",
+      "users": "users (friends tab / groups)",
+      "plus": "plus (add friend/create)",
+      "message": "message-circle (chats tab)",
+      "copy": "copy (invite code)",
+      "shield": "shield (privacy cues)",
+      "eye-off": "eye-off (vanishing messages)",
+      "check": "check (accept friend)",
+      "x": "x (decline friend / close)"
+    }
+  },
+  "animations": {
+    "modals": "Slide up from bottom (Sheet style).",
+    "messages": "Fade and slight scale-in when sending/receiving messages.",
+    "buttons": "Opacity feedback on press (activeOpacity: 0.7)."
+  },
+  "testing": {
+    "requirements": "ALL interactive elements (Touchable, Button, TextInput) MUST include a 'testID' attribute (which maps to data-testid in web/React Native testing) reflecting its role, e.g., testID='login-submit-button'."
+  },
+  "instructions_to_main_agent": [
+    "Build strictly as an Expo React Native application targeting iOS/Android/Web.",
+    "Do NOT deviate from the precise color palette defined above.",
+    "For typography, rely on React Native's default system sans-serif for body/headings, but EXPLICITLY use 'monospace' font family for all timestamps, keys, and encryption tags.",
+    "Use StyleSheet.create for all component styling, utilizing the provided exact HEX codes.",
+    "Implement navigation using Expo Router or React Navigation.",
+    "Ensure all user inputs have appropriate keyboard types (email-address, etc.) and autoCapitalize settings.",
+    "Ensure the lock icon and #4ADE80 green are consistently used as visual cues for privacy/security actions.",
+    "For the landing screen ASCII background, consider lightweight alternatives like react-native-svg or a simple animated gradient if Skia is too heavy.",
+    "Ensure all Touchables have hitSlop configured for better mobile accessibility."
+  ]
+}
