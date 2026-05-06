@@ -28,8 +28,12 @@ export default function Login() {
     setError(null);
     setLoading(true);
     try {
-      await login(email.trim(), password);
-      router.replace("/(tabs)/chats");
+      const result = await login(email.trim(), password);
+      if (result.needsPhrase) {
+        router.replace("/enter-phrase");
+      } else {
+        router.replace("/(tabs)/chats");
+      }
     } catch (e: any) {
       setError(e?.message || "Login failed");
     } finally {

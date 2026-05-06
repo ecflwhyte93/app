@@ -1,20 +1,23 @@
 // E2E encryption for Silent Signal — NaCl box (Curve25519 + XSalsa20-Poly1305).
-// Each user has a Curve25519 keypair. Messages are encrypted *per recipient*.
-//
-// Key derivation: secret = sha256(`${email}:${password}:silent-signal-v1`).
-// This makes the keypair reproducible from the user's password on any device,
-// while keeping the secret away from the server (the server stores only the
-// public key uploaded by the client).
+// Two key-derivation modes:
+//   1. "phrase" — keypair seed = sha256(mnemonic + ":mnemonic-seed-v1") where the
+//      mnemonic is a 24-word BIP39 phrase chosen at signup. Decoupled from the
+//      password, so password resets don't lose message history.
+//   2. "password" — legacy: seed = sha256(`${email}:${password}:silent-signal-v1`).
+//      Kept for backward compat with the seeded demo accounts.
 import nacl from "tweetnacl";
 import naclUtil from "tweetnacl-util";
 import CryptoJS from "crypto-js";
+import { generateMnemonic, validateMnemonic } from "@scure/bip39";
+import { wordlist } from "@scure/bip39/wordlists/english.js";
 
 export const KEYPAIR_DOMAIN = "silent-signal-v1";
+export const MNEMONIC_DOMAIN = "mnemonic-seed-v1";
 
 export type KeyPair = { publicKey: Uint8Array; secretKey: Uint8Array };
 
-export function deriveSeed(email: string, password: string): Uint8Array {
-  const hash = CryptoJS.SHA256(`${email.toLowerCase()}:${password}:${KEYPAIR_DOMAIN}`);
+function hashToBytes(input: string): Uint8Array {
+  const hash = CryptoJS.SHA256(input);
   const bytes = new Uint8Array(32);
   for (let i = 0; i < 8; i++) {
     const w = hash.words[i];
@@ -26,8 +29,35 @@ export function deriveSeed(email: string, password: string): Uint8Array {
   return bytes;
 }
 
-export function deriveKeyPair(email: string, password: string): KeyPair {
-  return nacl.box.keyPair.fromSecretKey(deriveSeed(email, password));
+export function deriveSeedFromPassword(email: string, password: string): Uint8Array {
+  return hashToBytes(`${email.toLowerCase()}:${password}:${KEYPAIR_DOMAIN}`);
+}
+
+export function deriveKeyPairFromPassword(email: string, password: string): KeyPair {
+  return nacl.box.keyPair.fromSecretKey(deriveSeedFromPassword(email, password));
+}
+
+export function deriveSeedFromMnemonic(mnemonic: string): Uint8Array {
+  // Normalize whitespace
+  const cleaned = mnemonic.trim().toLowerCase().split(/\s+/).join(" ");
+  return hashToBytes(`${cleaned}:${MNEMONIC_DOMAIN}`);
+}
+
+export function deriveKeyPairFromMnemonic(mnemonic: string): KeyPair {
+  return nacl.box.keyPair.fromSecretKey(deriveSeedFromMnemonic(mnemonic));
+}
+
+export function generateRecoveryPhrase(): string {
+  // 256-bit entropy → 24 words.
+  return generateMnemonic(wordlist, 256);
+}
+
+export function isValidRecoveryPhrase(phrase: string): boolean {
+  try {
+    return validateMnemonic(phrase.trim().toLowerCase().split(/\s+/).join(" "), wordlist);
+  } catch {
+    return false;
+  }
 }
 
 export function publicKeyToB64(pk: Uint8Array): string {

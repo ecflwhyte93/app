@@ -12,7 +12,7 @@ import secrets
 import logging
 import asyncio
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional, Dict, Set
+from typing import List, Optional, Dict, Set, Literal
 
 import bcrypt
 import jwt
@@ -76,16 +76,6 @@ def derive_pubkey_b64(email: str, password: str) -> str:
     return pk.encode(nacl.encoding.Base64Encoder).decode("ascii")
 
 
-def create_access_token(user_id: str, email: str) -> str:
-    payload = {
-        "sub": user_id,
-        "email": email,
-        "exp": datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TTL_MIN),
-        "type": "access",
-    }
-    return jwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
-
-
 def decode_token(token: str) -> dict:
     payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
     if payload.get("type") != "access":
@@ -100,9 +90,21 @@ def serialize_user(doc: dict) -> dict:
         "name": doc.get("name"),
         "phone": doc.get("phone"),
         "publicKey": doc.get("public_key"),
+        "keyMode": doc.get("key_mode", "password"),
         "role": doc.get("role", "user"),
         "created_at": doc.get("created_at").isoformat() if doc.get("created_at") else None,
     }
+
+
+def create_access_token(user_id: str, email: str, token_version: int = 1) -> str:
+    payload = {
+        "sub": user_id,
+        "email": email,
+        "tv": token_version,
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TTL_MIN),
+        "type": "access",
+    }
+    return jwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
 
 
 async def get_current_user(request: Request) -> dict:
@@ -118,6 +120,12 @@ async def get_current_user(request: Request) -> dict:
         user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
+        # Validate token version — clients with stale tokens after a "logout
+        # other devices" or password reset are evicted.
+        token_tv = payload.get("tv", 1)
+        user_tv = user.get("token_version", 1)
+        if token_tv != user_tv:
+            raise HTTPException(status_code=401, detail="Session has been revoked")
         return user
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
@@ -176,6 +184,7 @@ class RegisterIn(BaseModel):
     email: EmailStr
     password: str = Field(min_length=6, max_length=128)
     name: str = Field(min_length=1, max_length=80)
+    keyMode: Literal["password", "phrase"] = "password"
 
 
 class LoginIn(BaseModel):
@@ -242,19 +251,25 @@ async def register(payload: RegisterIn, response: Response):
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
 
-    public_key = derive_pubkey_b64(email, payload.password)
+    # For "phrase" mode the client owns the keypair and will upload its public
+    # key via PUT /api/users/me/public-key right after register. For "password"
+    # mode (legacy) we derive the public key deterministically from the
+    # email/password pair so demo users work out of the box.
+    public_key = derive_pubkey_b64(email, payload.password) if payload.keyMode == "password" else None
     doc = {
         "email": email,
         "password_hash": hash_password(payload.password),
         "name": payload.name.strip(),
         "phone": None,
         "public_key": public_key,
+        "key_mode": payload.keyMode,
+        "token_version": 1,
         "role": "user",
         "created_at": datetime.now(timezone.utc),
     }
     res = await db.users.insert_one(doc)
     user_id = str(res.inserted_id)
-    token = create_access_token(user_id, email)
+    token = create_access_token(user_id, email, 1)
     set_auth_cookie(response, token)
     doc["_id"] = res.inserted_id
     return {"user": serialize_user(doc), "access_token": token}
@@ -291,9 +306,23 @@ async def login(payload: LoginIn, request: Request, response: Response):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     await _clear_login_attempts(identifier)
-    token = create_access_token(str(user["_id"]), email)
+    token = create_access_token(str(user["_id"]), email, user.get("token_version", 1))
     set_auth_cookie(response, token)
     return {"user": serialize_user(user), "access_token": token}
+
+
+@api.post("/auth/logout-all-other")
+async def logout_all_other(response: Response, user=Depends(get_current_user)):
+    """Invalidate every existing session for the current user except this one.
+    Done by incrementing the user's `token_version` (every issued JWT carries
+    that value as a `tv` claim). A fresh token for the current session is
+    returned in the response body so the caller can swap their stored token."""
+    new_version = user.get("token_version", 1) + 1
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"token_version": new_version}})
+    new_token = create_access_token(str(user["_id"]), user["email"], new_version)
+    set_auth_cookie(response, new_token)
+    refreshed = await db.users.find_one({"_id": user["_id"]})
+    return {"user": serialize_user(refreshed), "access_token": new_token}
 
 
 @api.post("/auth/logout")
@@ -351,25 +380,25 @@ async def reset_password(payload: ResetPasswordIn):
     if not user:
         raise HTTPException(status_code=400, detail="Account no longer exists")
 
-    # Rotate password and clear the old public key — the new keypair will be
-    # regenerated and uploaded by the client the next time they log in.
-    new_pk = derive_pubkey_b64(user["email"], payload.new_password)
-    await db.users.update_one(
-        {"_id": uid},
-        {
-            "$set": {
-                "password_hash": hash_password(payload.new_password),
-                "public_key": new_pk,
-            }
-        },
-    )
+    # If the account uses password-derived keys (legacy), the new password
+    # implies a brand new keypair — recompute and store the public key.
+    # If the account uses a recovery phrase, the keypair is decoupled from the
+    # password, so we DO NOT touch public_key. Encrypted history stays readable.
+    update_fields = {
+        "password_hash": hash_password(payload.new_password),
+        "token_version": user.get("token_version", 1) + 1,
+    }
+    key_mode = user.get("key_mode", "password")
+    if key_mode == "password":
+        update_fields["public_key"] = derive_pubkey_b64(user["email"], payload.new_password)
+    await db.users.update_one({"_id": uid}, {"$set": update_fields})
     await db.password_reset_tokens.update_one(
         {"_id": doc["_id"]},
         {"$set": {"used": True, "used_at": datetime.now(timezone.utc)}},
     )
     # Clear any brute-force lockouts for this email as well.
     await db.login_attempts.delete_many({"identifier": {"$regex": f":{re.escape(user['email'])}$"}})
-    return {"ok": True}
+    return {"ok": True, "keyMode": key_mode}
 
 
 @api.get("/auth/me")
@@ -849,6 +878,8 @@ async def _seed_demo() -> None:
             "name": u["name"],
             "phone": u["phone"],
             "public_key": public_key,
+            "key_mode": "password",
+            "token_version": 1,
             "role": "user",
             "created_at": datetime.now(timezone.utc),
         }

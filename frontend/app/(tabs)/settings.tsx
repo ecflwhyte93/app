@@ -12,15 +12,67 @@ import {
 import { Feather } from "@expo/vector-icons";
 import { router } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
+import * as Clipboard from "expo-clipboard";
 import { useAuth } from "../../src/context/AuthContext";
 import { api } from "../../src/lib/api";
+import { mnemonicStore } from "../../src/lib/keystore";
 import { C, R, SP } from "../../src/theme";
 
 export default function SettingsTab() {
-  const { user, refresh, logout } = useAuth();
+  const { user, refresh, logout, logoutOtherDevices } = useAuth();
   const [name, setName] = useState(user?.name || "");
   const [phone, setPhone] = useState(user?.phone || "");
   const [saving, setSaving] = useState(false);
+  const [evicting, setEvicting] = useState(false);
+  const [revealedPhrase, setRevealedPhrase] = useState<string | null>(null);
+
+  const reveal = async () => {
+    if (!user) return;
+    Alert.alert(
+      "Show recovery phrase?",
+      "Make sure no one else can see your screen. The phrase grants full access to your encrypted history.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Show",
+          style: "destructive",
+          onPress: async () => {
+            const stored = await mnemonicStore.get(user.email);
+            if (!stored) {
+              Alert.alert("Not on this device", "Your recovery phrase isn't stored on this device.");
+              return;
+            }
+            setRevealedPhrase(stored);
+          },
+        },
+      ]
+    );
+  };
+
+  const evictOthers = () => {
+    Alert.alert(
+      "Sign out other devices?",
+      "Every other device or browser tab signed in to your account will be logged out immediately. You will stay signed in here.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Sign out others",
+          style: "destructive",
+          onPress: async () => {
+            setEvicting(true);
+            try {
+              await logoutOtherDevices();
+              Alert.alert("Done", "All other sessions have been signed out.");
+            } catch (e: any) {
+              Alert.alert("Failed", e?.message || "Try again");
+            } finally {
+              setEvicting(false);
+            }
+          },
+        },
+      ]
+    );
+  };
 
   const save = async () => {
     setSaving(true);
@@ -111,6 +163,72 @@ export default function SettingsTab() {
             Silent Signal · zero-knowledge messaging. Your messages never reach our servers in
             plaintext.
           </Text>
+        </View>
+
+        {/* Recovery phrase (phrase mode only) */}
+        {user?.keyMode === "phrase" && (
+          <View style={styles.section}>
+            <Text style={styles.sectionLabel}>RECOVERY PHRASE</Text>
+            <Text style={styles.helper}>
+              Use these 24 words to restore access on a new device. Resetting your password will{" "}
+              <Text style={{ color: C.primary, fontWeight: "700" }}>NOT</Text> destroy your encrypted
+              history because your keys are tied to this phrase, not your password.
+            </Text>
+            {revealedPhrase ? (
+              <View style={styles.phraseGrid}>
+                {revealedPhrase.split(/\s+/).map((w, i) => (
+                  <View key={`${i}-${w}`} style={styles.wordCell}>
+                    <Text style={styles.wordIndex}>{String(i + 1).padStart(2, "0")}</Text>
+                    <Text style={styles.wordText}>{w}</Text>
+                  </View>
+                ))}
+                <View style={{ flexDirection: "row", gap: SP.sm, marginTop: SP.sm }}>
+                  <TouchableOpacity
+                    style={styles.ghostBtn}
+                    onPress={async () => {
+                      await Clipboard.setStringAsync(revealedPhrase);
+                      Alert.alert("Copied", "Phrase copied to clipboard");
+                    }}
+                  >
+                    <Feather name="copy" size={14} color={C.text} />
+                    <Text style={styles.ghostBtnText}>Copy</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.ghostBtn}
+                    onPress={() => setRevealedPhrase(null)}
+                  >
+                    <Feather name="eye-off" size={14} color={C.text} />
+                    <Text style={styles.ghostBtnText}>Hide</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            ) : (
+              <TouchableOpacity testID="reveal-phrase-btn" style={styles.ghostBtn} onPress={reveal}>
+                <Feather name="eye" size={14} color={C.text} />
+                <Text style={styles.ghostBtnText}>Show recovery phrase</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        )}
+
+        {/* Session security */}
+        <View style={styles.section}>
+          <Text style={styles.sectionLabel}>SESSION SECURITY</Text>
+          <TouchableOpacity
+            testID="logout-others-btn"
+            disabled={evicting}
+            style={[styles.warnBtn, evicting && { opacity: 0.6 }]}
+            onPress={evictOthers}
+          >
+            {evicting ? (
+              <ActivityIndicator color="#fbbf24" />
+            ) : (
+              <>
+                <Feather name="log-out" size={14} color="#fbbf24" />
+                <Text style={styles.warnBtnText}>Sign out all other devices</Text>
+              </>
+            )}
+          </TouchableOpacity>
         </View>
 
         <TouchableOpacity
@@ -223,4 +341,63 @@ const styles = StyleSheet.create({
     marginTop: SP.lg,
   },
   dangerBtnText: { color: C.danger, fontSize: 14, fontWeight: "600" },
+  warnBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    backgroundColor: "rgba(251,191,36,0.06)",
+    borderWidth: 1,
+    borderColor: "rgba(251,191,36,0.3)",
+    borderRadius: R.pill,
+    paddingVertical: 14,
+    marginTop: SP.sm,
+  },
+  warnBtnText: { color: "#fbbf24", fontSize: 14, fontWeight: "600" },
+  section: { marginTop: SP.xl },
+  sectionLabel: {
+    color: C.muted,
+    fontSize: 11,
+    fontFamily: "monospace",
+    letterSpacing: 1.5,
+    marginBottom: SP.sm,
+  },
+  ghostBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    backgroundColor: C.surface,
+    borderColor: C.border,
+    borderWidth: 1,
+    borderRadius: R.pill,
+    paddingVertical: 12,
+    paddingHorizontal: SP.md,
+    flex: 1,
+  },
+  ghostBtnText: { color: C.text, fontSize: 13, fontWeight: "600" },
+  phraseGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+    marginTop: SP.sm,
+    backgroundColor: C.surface,
+    padding: SP.sm,
+    borderRadius: R.md,
+    borderWidth: 1,
+    borderColor: "rgba(74,222,128,0.3)",
+  },
+  wordCell: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    width: "30%",
+    minWidth: 95,
+    backgroundColor: C.bg,
+    borderRadius: R.sm,
+    paddingVertical: 6,
+    paddingHorizontal: 8,
+  },
+  wordIndex: { color: C.muted, fontFamily: "monospace", fontSize: 9, width: 16 },
+  wordText: { color: C.primary, fontFamily: "monospace", fontSize: 12, fontWeight: "600" },
 });
