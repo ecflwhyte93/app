@@ -139,6 +139,14 @@ export default function Login() {
             </Text>
           </TouchableOpacity>
 
+          <TouchableOpacity
+            testID="forgot-link"
+            onPress={() => router.push("/forgot-password")}
+            style={{ marginTop: SP.sm }}
+          >
+            <Text style={[styles.demoLink, { color: C.primary }]}>Forgot password?</Text>
+          </TouchableOpacity>
+
           <View style={styles.footer}>
             <Text style={styles.footerText}>New here?</Text>
             <TouchableOpacity testID="go-register" onPress={() => router.replace("/register")}>

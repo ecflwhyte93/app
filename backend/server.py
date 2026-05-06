@@ -188,6 +188,15 @@ class UpdateProfileIn(BaseModel):
     phone: Optional[str] = None
 
 
+class ForgotPasswordIn(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordIn(BaseModel):
+    token: str = Field(min_length=10, max_length=128)
+    new_password: str = Field(min_length=6, max_length=128)
+
+
 class PublicKeyIn(BaseModel):
     publicKey: str = Field(min_length=10, max_length=128)
 
@@ -290,6 +299,76 @@ async def login(payload: LoginIn, request: Request, response: Response):
 @api.post("/auth/logout")
 async def logout(response: Response, _user=Depends(get_current_user)):
     response.delete_cookie("access_token", path="/")
+    return {"ok": True}
+
+
+@api.post("/auth/forgot-password")
+async def forgot_password(payload: ForgotPasswordIn, request: Request):
+    """Always returns 200 (don't leak account existence). If the user exists,
+    creates a single-use token stored in `password_reset_tokens` with 1-hour
+    expiry and logs the reset link. Since this environment has no email
+    transport, the token is also echoed back as `demo_link` for demo purposes.
+    """
+    email = payload.email.lower()
+    user = await db.users.find_one({"email": email})
+    origin = request.headers.get("origin") or os.environ.get("FRONTEND_URL", "")
+    demo_link = None
+    if user:
+        token = secrets.token_urlsafe(32)
+        now = datetime.now(timezone.utc)
+        await db.password_reset_tokens.insert_one({
+            "token": token,
+            "user_id": str(user["_id"]),
+            "email": email,
+            "created_at": now,
+            "expires_at": now + timedelta(hours=1),
+            "used": False,
+        })
+        link = f"{origin}/reset-password?token={token}" if origin else f"/reset-password?token={token}"
+        logger.info("Password reset link for %s: %s", email, link)
+        demo_link = link
+    return {"ok": True, "demo_link": demo_link}
+
+
+@api.post("/auth/reset-password")
+async def reset_password(payload: ResetPasswordIn):
+    doc = await db.password_reset_tokens.find_one({"token": payload.token})
+    if not doc:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+    if doc.get("used"):
+        raise HTTPException(status_code=400, detail="This reset token has already been used")
+    expires_at = doc.get("expires_at")
+    if expires_at and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at and expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="This reset token has expired")
+
+    try:
+        uid = ObjectId(doc["user_id"])
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user reference")
+    user = await db.users.find_one({"_id": uid})
+    if not user:
+        raise HTTPException(status_code=400, detail="Account no longer exists")
+
+    # Rotate password and clear the old public key — the new keypair will be
+    # regenerated and uploaded by the client the next time they log in.
+    new_pk = derive_pubkey_b64(user["email"], payload.new_password)
+    await db.users.update_one(
+        {"_id": uid},
+        {
+            "$set": {
+                "password_hash": hash_password(payload.new_password),
+                "public_key": new_pk,
+            }
+        },
+    )
+    await db.password_reset_tokens.update_one(
+        {"_id": doc["_id"]},
+        {"$set": {"used": True, "used_at": datetime.now(timezone.utc)}},
+    )
+    # Clear any brute-force lockouts for this email as well.
+    await db.login_attempts.delete_many({"identifier": {"$regex": f":{re.escape(user['email'])}$"}})
     return {"ok": True}
 
 
@@ -849,6 +928,8 @@ async def on_startup():
     await db.messages.create_index([("roomId", 1), ("created_at", 1)])
     await db.messages.create_index("expiresAt", expireAfterSeconds=0)
     await db.login_attempts.create_index("identifier", unique=True)
+    await db.password_reset_tokens.create_index("token", unique=True)
+    await db.password_reset_tokens.create_index("expires_at", expireAfterSeconds=0)
 
     # One-shot migration: drop legacy messages with old schema (had `ciphertext` field at root level).
     # New schema stores `encryptedFor` map.
