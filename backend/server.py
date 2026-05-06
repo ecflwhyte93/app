@@ -1,75 +1,649 @@
-from fastapi import FastAPI, APIRouter
 from dotenv import load_dotenv
-from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
-import os
-import logging
 from pathlib import Path
-from pydantic import BaseModel, Field
-from typing import List
-import uuid
-from datetime import datetime
-
 
 ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+load_dotenv(ROOT_DIR / ".env")
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
+import os
+import secrets
+import logging
+from datetime import datetime, timezone, timedelta
+from typing import List, Optional, Literal
+
+import bcrypt
+import jwt
+from bson import ObjectId
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, Query
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel, Field, EmailStr
+
+# ─── Logging ───────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("silent-signal")
+
+# ─── DB ────────────────────────────────────────────────────────────────────
+mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+db = client[os.environ["DB_NAME"]]
 
-# Create the main app without a prefix
-app = FastAPI()
+# ─── Auth helpers ──────────────────────────────────────────────────────────
+JWT_ALGORITHM = "HS256"
+ACCESS_TTL_MIN = 60 * 24 * 7  # 7 days for mobile demo
+ROOM_DEMO_PASSPHRASE = "silent-signal-demo-key-v1"  # known to server only for room key derivation, never sees plaintext
 
-# Create a router with the /api prefix
-api_router = APIRouter(prefix="/api")
+
+def get_jwt_secret() -> str:
+    return os.environ["JWT_SECRET"]
 
 
-# Define Models
-class StatusCheck(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
 
-# Add your routes to the router instead of directly to app
-@api_router.get("/")
+def verify_password(plain: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+
+def create_access_token(user_id: str, email: str) -> str:
+    payload = {
+        "sub": user_id,
+        "email": email,
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TTL_MIN),
+        "type": "access",
+    }
+    return jwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
+
+
+def serialize_user(doc: dict) -> dict:
+    return {
+        "id": str(doc["_id"]),
+        "email": doc.get("email"),
+        "name": doc.get("name"),
+        "phone": doc.get("phone"),
+        "role": doc.get("role", "user"),
+        "created_at": doc.get("created_at").isoformat() if doc.get("created_at") else None,
+    }
+
+
+async def get_current_user(request: Request) -> dict:
+    token = request.cookies.get("access_token")
+    if not token:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:]
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "access":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+        user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+        return user
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def set_auth_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key="access_token",
+        value=token,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        max_age=ACCESS_TTL_MIN * 60,
+        path="/",
+    )
+
+
+# ─── Pydantic Models ───────────────────────────────────────────────────────
+class RegisterIn(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=6, max_length=128)
+    name: str = Field(min_length=1, max_length=80)
+
+
+class LoginIn(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class UpdateProfileIn(BaseModel):
+    name: Optional[str] = None
+    phone: Optional[str] = None
+
+
+class FriendRequestIn(BaseModel):
+    addresseeId: str
+
+
+class FriendActionIn(BaseModel):
+    friendId: str
+
+
+class CreateRoomIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+
+
+class JoinRoomIn(BaseModel):
+    inviteCode: str = Field(min_length=3, max_length=64)
+
+
+class SendMessageIn(BaseModel):
+    roomId: str
+    ciphertext: str
+    iv: str
+    salt: str
+    ephemeral: bool = False
+
+
+# ─── App ───────────────────────────────────────────────────────────────────
+app = FastAPI(title="Silent Signal API")
+api = APIRouter(prefix="/api")
+
+
+# ─── Auth routes ───────────────────────────────────────────────────────────
+@api.post("/auth/register")
+async def register(payload: RegisterIn, response: Response):
+    email = payload.email.lower()
+    existing = await db.users.find_one({"email": email})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    doc = {
+        "email": email,
+        "password_hash": hash_password(payload.password),
+        "name": payload.name.strip(),
+        "phone": None,
+        "role": "user",
+        "created_at": datetime.now(timezone.utc),
+    }
+    res = await db.users.insert_one(doc)
+    user_id = str(res.inserted_id)
+    token = create_access_token(user_id, email)
+    set_auth_cookie(response, token)
+    doc["_id"] = res.inserted_id
+    return {"user": serialize_user(doc), "access_token": token}
+
+
+@api.post("/auth/login")
+async def login(payload: LoginIn, response: Response):
+    email = payload.email.lower()
+    user = await db.users.find_one({"email": email})
+    if not user or not verify_password(payload.password, user.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    token = create_access_token(str(user["_id"]), email)
+    set_auth_cookie(response, token)
+    return {"user": serialize_user(user), "access_token": token}
+
+
+@api.post("/auth/logout")
+async def logout(response: Response, _user=Depends(get_current_user)):
+    response.delete_cookie("access_token", path="/")
+    return {"ok": True}
+
+
+@api.get("/auth/me")
+async def me(user=Depends(get_current_user)):
+    return {"user": serialize_user(user)}
+
+
+@api.patch("/users/me")
+async def update_me(payload: UpdateProfileIn, user=Depends(get_current_user)):
+    updates = {}
+    if payload.name is not None and payload.name.strip():
+        updates["name"] = payload.name.strip()
+    if payload.phone is not None:
+        updates["phone"] = payload.phone.strip() or None
+    if updates:
+        await db.users.update_one({"_id": user["_id"]}, {"$set": updates})
+        user = await db.users.find_one({"_id": user["_id"]})
+    return {"user": serialize_user(user)}
+
+
+# ─── Friends ───────────────────────────────────────────────────────────────
+async def _user_brief(uid_str: str) -> dict:
+    try:
+        u = await db.users.find_one({"_id": ObjectId(uid_str)})
+    except Exception:
+        u = None
+    if not u:
+        return {"id": uid_str, "name": "Unknown", "email": None, "phone": None}
+    return {
+        "id": str(u["_id"]),
+        "name": u.get("name"),
+        "email": u.get("email"),
+        "phone": u.get("phone"),
+    }
+
+
+@api.get("/friends/search")
+async def search_friends(q: str = Query(..., min_length=1), user=Depends(get_current_user)):
+    me_id = str(user["_id"])
+    regex = {"$regex": q, "$options": "i"}
+    cursor = db.users.find(
+        {
+            "$and": [
+                {"_id": {"$ne": user["_id"]}},
+                {"$or": [{"name": regex}, {"email": regex}, {"phone": regex}]},
+            ]
+        }
+    ).limit(20)
+    results = []
+    async for u in cursor:
+        results.append({
+            "id": str(u["_id"]),
+            "name": u.get("name"),
+            "email": u.get("email"),
+            "phone": u.get("phone"),
+        })
+    _ = me_id
+    return {"results": results}
+
+
+async def _get_or_create_dm_room(user_a_id: str, user_b_id: str) -> dict:
+    members_sorted = sorted([user_a_id, user_b_id])
+    existing = await db.rooms.find_one({"type": "dm", "members": members_sorted})
+    if existing:
+        return existing
+    doc = {
+        "name": "Direct Message",
+        "type": "dm",
+        "inviteCode": None,
+        "createdBy": user_a_id,
+        "members": members_sorted,
+        "created_at": datetime.now(timezone.utc),
+    }
+    res = await db.rooms.insert_one(doc)
+    doc["_id"] = res.inserted_id
+    return doc
+
+
+@api.post("/friends/request")
+async def friend_request(payload: FriendRequestIn, user=Depends(get_current_user)):
+    me_id = str(user["_id"])
+    if payload.addresseeId == me_id:
+        raise HTTPException(status_code=400, detail="Cannot add yourself")
+    try:
+        target_oid = ObjectId(payload.addresseeId)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user id")
+    target = await db.users.find_one({"_id": target_oid})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    existing = await db.friends.find_one({
+        "$or": [
+            {"requesterId": me_id, "addresseeId": payload.addresseeId},
+            {"requesterId": payload.addresseeId, "addresseeId": me_id},
+        ]
+    })
+    if existing:
+        raise HTTPException(status_code=400, detail="Friend request already exists")
+
+    doc = {
+        "requesterId": me_id,
+        "addresseeId": payload.addresseeId,
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc),
+    }
+    res = await db.friends.insert_one(doc)
+    return {"id": str(res.inserted_id), "status": "pending"}
+
+
+@api.post("/friends/accept")
+async def friend_accept(payload: FriendActionIn, user=Depends(get_current_user)):
+    me_id = str(user["_id"])
+    try:
+        fid = ObjectId(payload.friendId)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid friend id")
+    f = await db.friends.find_one({"_id": fid})
+    if not f or f["addresseeId"] != me_id:
+        raise HTTPException(status_code=404, detail="Friend request not found")
+    if f["status"] != "pending":
+        raise HTTPException(status_code=400, detail="Already handled")
+    await db.friends.update_one({"_id": fid}, {"$set": {"status": "accepted"}})
+    # auto-create DM room
+    await _get_or_create_dm_room(f["requesterId"], me_id)
+    return {"ok": True}
+
+
+@api.post("/friends/decline")
+async def friend_decline(payload: FriendActionIn, user=Depends(get_current_user)):
+    me_id = str(user["_id"])
+    try:
+        fid = ObjectId(payload.friendId)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid friend id")
+    f = await db.friends.find_one({"_id": fid})
+    if not f or f["addresseeId"] != me_id:
+        raise HTTPException(status_code=404, detail="Friend request not found")
+    await db.friends.update_one({"_id": fid}, {"$set": {"status": "declined"}})
+    return {"ok": True}
+
+
+@api.get("/friends/list")
+async def friends_list(user=Depends(get_current_user)):
+    me_id = str(user["_id"])
+    cursor = db.friends.find({"$or": [{"requesterId": me_id}, {"addresseeId": me_id}]})
+    items = []
+    async for f in cursor:
+        is_requester = f["requesterId"] == me_id
+        other_id = f["addresseeId"] if is_requester else f["requesterId"]
+        items.append({
+            "id": str(f["_id"]),
+            "status": f["status"],
+            "isRequester": is_requester,
+            "otherUser": await _user_brief(other_id),
+            "created_at": f["created_at"].isoformat(),
+        })
+    return {"items": items}
+
+
+# ─── Rooms ─────────────────────────────────────────────────────────────────
+async def _last_message(room_id: str) -> Optional[dict]:
+    msg = await db.messages.find_one({"roomId": room_id}, sort=[("created_at", -1)])
+    if not msg:
+        return None
+    return {
+        "id": str(msg["_id"]),
+        "senderId": msg["senderId"],
+        "senderName": (await _user_brief(msg["senderId"]))["name"],
+        "createdAt": msg["created_at"].isoformat(),
+        "ephemeral": msg.get("ephemeral", False),
+    }
+
+
+def _room_display_name(room: dict, me_id: str, others: dict) -> str:
+    if room["type"] == "dm":
+        # name = the other member's name
+        for m in room["members"]:
+            if m != me_id:
+                return others.get(m, "Direct Message")
+        return "Direct Message"
+    return room.get("name", "Group")
+
+
+@api.get("/rooms")
+async def list_rooms(user=Depends(get_current_user)):
+    me_id = str(user["_id"])
+    cursor = db.rooms.find({"members": me_id}).sort("created_at", -1)
+    rooms = []
+    async for r in cursor:
+        # collect other-member display names for DMs
+        others_map = {}
+        if r["type"] == "dm":
+            for m in r["members"]:
+                if m != me_id:
+                    others_map[m] = (await _user_brief(m))["name"] or "Unknown"
+        last = await _last_message(str(r["_id"]))
+        rooms.append({
+            "id": str(r["_id"]),
+            "name": _room_display_name(r, me_id, others_map),
+            "type": r["type"],
+            "inviteCode": r.get("inviteCode"),
+            "memberCount": len(r["members"]),
+            "lastMessage": last,
+            "createdAt": r["created_at"].isoformat(),
+        })
+    # sort: rooms with last message most recent first, otherwise by created_at
+    rooms.sort(key=lambda x: (x["lastMessage"]["createdAt"] if x["lastMessage"] else x["createdAt"]), reverse=True)
+    return {"items": rooms}
+
+
+@api.get("/rooms/{room_id}")
+async def get_room(room_id: str, user=Depends(get_current_user)):
+    me_id = str(user["_id"])
+    try:
+        rid = ObjectId(room_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid room id")
+    r = await db.rooms.find_one({"_id": rid})
+    if not r or me_id not in r["members"]:
+        raise HTTPException(status_code=404, detail="Room not found")
+    others_map = {}
+    members = []
+    for m in r["members"]:
+        brief = await _user_brief(m)
+        members.append(brief)
+        if m != me_id:
+            others_map[m] = brief["name"] or "Unknown"
+    return {
+        "id": str(r["_id"]),
+        "name": _room_display_name(r, me_id, others_map),
+        "type": r["type"],
+        "inviteCode": r.get("inviteCode"),
+        "members": members,
+        "createdAt": r["created_at"].isoformat(),
+    }
+
+
+@api.post("/rooms")
+async def create_room(payload: CreateRoomIn, user=Depends(get_current_user)):
+    me_id = str(user["_id"])
+    code = secrets.token_urlsafe(8)[:12].replace("-", "").replace("_", "")
+    while await db.rooms.find_one({"inviteCode": code}):
+        code = secrets.token_urlsafe(8)[:12].replace("-", "").replace("_", "")
+    doc = {
+        "name": payload.name.strip(),
+        "type": "group",
+        "inviteCode": code,
+        "createdBy": me_id,
+        "members": [me_id],
+        "created_at": datetime.now(timezone.utc),
+    }
+    res = await db.rooms.insert_one(doc)
+    return {"id": str(res.inserted_id), "name": doc["name"], "inviteCode": code, "type": "group"}
+
+
+@api.post("/rooms/join")
+async def join_room(payload: JoinRoomIn, user=Depends(get_current_user)):
+    me_id = str(user["_id"])
+    r = await db.rooms.find_one({"inviteCode": payload.inviteCode.strip()})
+    if not r:
+        raise HTTPException(status_code=404, detail="Invalid invite code")
+    if me_id in r["members"]:
+        return {"id": str(r["_id"]), "alreadyMember": True}
+    await db.rooms.update_one({"_id": r["_id"]}, {"$push": {"members": me_id}})
+    return {"id": str(r["_id"]), "alreadyMember": False}
+
+
+# ─── Messages ──────────────────────────────────────────────────────────────
+@api.get("/messages")
+async def list_messages(roomId: str, limit: int = 100, user=Depends(get_current_user)):
+    me_id = str(user["_id"])
+    try:
+        rid = ObjectId(roomId)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid room id")
+    r = await db.rooms.find_one({"_id": rid})
+    if not r or me_id not in r["members"]:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    # purge expired ephemeral messages
+    now = datetime.now(timezone.utc)
+    await db.messages.delete_many({"roomId": roomId, "expiresAt": {"$lte": now}})
+
+    cursor = db.messages.find({"roomId": roomId}).sort("created_at", 1).limit(limit)
+    items = []
+    async for m in cursor:
+        items.append({
+            "id": str(m["_id"]),
+            "roomId": m["roomId"],
+            "senderId": m["senderId"],
+            "senderName": (await _user_brief(m["senderId"]))["name"],
+            "ciphertext": m["ciphertext"],
+            "iv": m["iv"],
+            "salt": m["salt"],
+            "ephemeral": m.get("ephemeral", False),
+            "createdAt": m["created_at"].isoformat(),
+        })
+    return {"items": items}
+
+
+@api.post("/messages")
+async def send_message(payload: SendMessageIn, user=Depends(get_current_user)):
+    me_id = str(user["_id"])
+    try:
+        rid = ObjectId(payload.roomId)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid room id")
+    r = await db.rooms.find_one({"_id": rid})
+    if not r or me_id not in r["members"]:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(minutes=2) if payload.ephemeral else None
+    doc = {
+        "roomId": payload.roomId,
+        "senderId": me_id,
+        "ciphertext": payload.ciphertext,
+        "iv": payload.iv,
+        "salt": payload.salt,
+        "ephemeral": payload.ephemeral,
+        "expiresAt": expires_at,
+        "created_at": now,
+    }
+    res = await db.messages.insert_one(doc)
+    return {
+        "id": str(res.inserted_id),
+        "roomId": payload.roomId,
+        "senderId": me_id,
+        "senderName": user.get("name"),
+        "ciphertext": payload.ciphertext,
+        "iv": payload.iv,
+        "salt": payload.salt,
+        "ephemeral": payload.ephemeral,
+        "createdAt": now.isoformat(),
+    }
+
+
+# ─── Health ────────────────────────────────────────────────────────────────
+@api.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {"message": "Silent Signal API", "ok": True}
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.dict()
-    status_obj = StatusCheck(**status_dict)
-    _ = await db.status_checks.insert_one(status_obj.dict())
-    return status_obj
 
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    status_checks = await db.status_checks.find().to_list(1000)
-    return [StatusCheck(**status_check) for status_check in status_checks]
-
-# Include the router in the main app
-app.include_router(api_router)
-
+# ─── Mount + CORS ──────────────────────────────────────────────────────────
+app.include_router(api)
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
     allow_origins=["*"],
+    allow_credentials=False,  # Bearer-token mode for mobile; cookies still work cross-origin without credentials
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+
+# ─── Startup: indexes + seed demo data ─────────────────────────────────────
+async def _seed_demo() -> None:
+    demo_users = [
+        {"email": "alex@silent.app", "password": "demo1234", "name": "Alex Rivera", "phone": "+15551110001"},
+        {"email": "maya@silent.app", "password": "demo1234", "name": "Maya Tan", "phone": "+15551110002"},
+        {"email": "jordan@silent.app", "password": "demo1234", "name": "Jordan Kim", "phone": "+15551110003"},
+    ]
+    ids: dict[str, str] = {}
+    for u in demo_users:
+        email = u["email"].lower()
+        existing = await db.users.find_one({"email": email})
+        if existing:
+            ids[email] = str(existing["_id"])
+            continue
+        doc = {
+            "email": email,
+            "password_hash": hash_password(u["password"]),
+            "name": u["name"],
+            "phone": u["phone"],
+            "role": "user",
+            "created_at": datetime.now(timezone.utc),
+        }
+        res = await db.users.insert_one(doc)
+        ids[email] = str(res.inserted_id)
+
+    # admin
+    admin_email = os.environ.get("ADMIN_EMAIL", "admin@silent.app").lower()
+    admin_password = os.environ.get("ADMIN_PASSWORD", "admin12345")
+    admin = await db.users.find_one({"email": admin_email})
+    if admin is None:
+        doc = {
+            "email": admin_email,
+            "password_hash": hash_password(admin_password),
+            "name": "Admin",
+            "phone": None,
+            "role": "admin",
+            "created_at": datetime.now(timezone.utc),
+        }
+        res = await db.users.insert_one(doc)
+        ids[admin_email] = str(res.inserted_id)
+    elif not verify_password(admin_password, admin.get("password_hash", "")):
+        await db.users.update_one(
+            {"_id": admin["_id"]},
+            {"$set": {"password_hash": hash_password(admin_password)}},
+        )
+        ids[admin_email] = str(admin["_id"])
+    else:
+        ids[admin_email] = str(admin["_id"])
+
+    # friendships: alex<->maya accepted, alex<->jordan accepted, maya->jordan pending
+    pairs = [
+        (ids["alex@silent.app"], ids["maya@silent.app"], "accepted"),
+        (ids["alex@silent.app"], ids["jordan@silent.app"], "accepted"),
+        (ids["maya@silent.app"], ids["jordan@silent.app"], "pending"),
+    ]
+    for req, addr, status in pairs:
+        existing = await db.friends.find_one({
+            "$or": [
+                {"requesterId": req, "addresseeId": addr},
+                {"requesterId": addr, "addresseeId": req},
+            ]
+        })
+        if not existing:
+            await db.friends.insert_one({
+                "requesterId": req,
+                "addresseeId": addr,
+                "status": status,
+                "created_at": datetime.now(timezone.utc),
+            })
+
+    # DM rooms for accepted friendships
+    for a, b, status in pairs:
+        if status == "accepted":
+            await _get_or_create_dm_room(a, b)
+
+    # Group room "Privacy Circle" with all 3 demo users
+    group = await db.rooms.find_one({"type": "group", "name": "Privacy Circle"})
+    if not group:
+        code = "circle2026"
+        await db.rooms.insert_one({
+            "name": "Privacy Circle",
+            "type": "group",
+            "inviteCode": code,
+            "createdBy": ids["alex@silent.app"],
+            "members": [ids["alex@silent.app"], ids["maya@silent.app"], ids["jordan@silent.app"]],
+            "created_at": datetime.now(timezone.utc),
+        })
+
+
+@app.on_event("startup")
+async def on_startup():
+    await db.users.create_index("email", unique=True)
+    await db.friends.create_index([("requesterId", 1), ("addresseeId", 1)])
+    await db.rooms.create_index("inviteCode")
+    await db.rooms.create_index("members")
+    await db.messages.create_index([("roomId", 1), ("created_at", 1)])
+    await db.messages.create_index("expiresAt", expireAfterSeconds=0)
+    await _seed_demo()
+    logger.info("Silent Signal API ready")
+
 
 @app.on_event("shutdown")
-async def shutdown_db_client():
+async def on_shutdown():
     client.close()
