@@ -143,8 +143,12 @@ async def _is_locked(identifier: str) -> Optional[datetime]:
     if not doc:
         return None
     locked_until = doc.get("locked_until")
-    if locked_until and locked_until > datetime.now(timezone.utc):
-        return locked_until
+    if locked_until:
+        # Mongo returns naive datetimes; treat as UTC for comparison.
+        if locked_until.tzinfo is None:
+            locked_until = locked_until.replace(tzinfo=timezone.utc)
+        if locked_until > datetime.now(timezone.utc):
+            return locked_until
     return None
 
 
@@ -247,10 +251,21 @@ async def register(payload: RegisterIn, response: Response):
     return {"user": serialize_user(doc), "access_token": token}
 
 
+def _client_ip(request: Request) -> str:
+    # Honor X-Forwarded-For first hop when behind ingress/proxy; fall back to
+    # the raw transport address. Falls back to "unknown" if neither is set.
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        first = xff.split(",")[0].strip()
+        if first:
+            return first
+    return request.client.host if request.client else "unknown"
+
+
 @api.post("/auth/login")
 async def login(payload: LoginIn, request: Request, response: Response):
     email = payload.email.lower()
-    ip = request.client.host if request.client else "unknown"
+    ip = _client_ip(request)
     identifier = f"{ip}:{email}"
 
     locked_until = await _is_locked(identifier)
@@ -588,12 +603,14 @@ manager = ConnectionManager()
 async def websocket_endpoint(websocket: WebSocket):
     token = websocket.query_params.get("token")
     if not token:
+        await websocket.accept()
         await websocket.close(code=4401)
         return
     try:
         payload = decode_token(token)
         user_id = payload["sub"]
     except Exception:
+        await websocket.accept()
         await websocket.close(code=4401)
         return
 
