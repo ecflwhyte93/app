@@ -5,15 +5,31 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
 import os
+import re
+import json
+import hashlib
 import secrets
 import logging
+import asyncio
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional, Literal
+from typing import List, Optional, Dict, Set
 
 import bcrypt
 import jwt
+import nacl.public
+import nacl.encoding
 from bson import ObjectId
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, Query
+from fastapi import (
+    FastAPI,
+    APIRouter,
+    HTTPException,
+    Depends,
+    Request,
+    Response,
+    Query,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
@@ -30,7 +46,9 @@ db = client[os.environ["DB_NAME"]]
 # ─── Auth helpers ──────────────────────────────────────────────────────────
 JWT_ALGORITHM = "HS256"
 ACCESS_TTL_MIN = 60 * 24 * 7  # 7 days for mobile demo
-ROOM_DEMO_PASSPHRASE = "silent-signal-demo-key-v1"  # known to server only for room key derivation, never sees plaintext
+LOGIN_MAX_FAILS = 5
+LOGIN_LOCKOUT_MIN = 15
+KEYPAIR_DOMAIN = "silent-signal-v1"
 
 
 def get_jwt_secret() -> str:
@@ -48,6 +66,16 @@ def verify_password(plain: str, hashed: str) -> bool:
         return False
 
 
+def derive_pubkey_b64(email: str, password: str) -> str:
+    """Mirror of the client-side keypair derivation so seeded demo users have
+    a known public key uploaded by the server. Secret = sha256(email:password:domain).
+    """
+    seed = hashlib.sha256(f"{email}:{password}:{KEYPAIR_DOMAIN}".encode("utf-8")).digest()
+    sk = nacl.public.PrivateKey(seed)
+    pk = sk.public_key
+    return pk.encode(nacl.encoding.Base64Encoder).decode("ascii")
+
+
 def create_access_token(user_id: str, email: str) -> str:
     payload = {
         "sub": user_id,
@@ -58,12 +86,20 @@ def create_access_token(user_id: str, email: str) -> str:
     return jwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
 
 
+def decode_token(token: str) -> dict:
+    payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
+    if payload.get("type") != "access":
+        raise jwt.InvalidTokenError("wrong type")
+    return payload
+
+
 def serialize_user(doc: dict) -> dict:
     return {
         "id": str(doc["_id"]),
         "email": doc.get("email"),
         "name": doc.get("name"),
         "phone": doc.get("phone"),
+        "publicKey": doc.get("public_key"),
         "role": doc.get("role", "user"),
         "created_at": doc.get("created_at").isoformat() if doc.get("created_at") else None,
     }
@@ -78,9 +114,7 @@ async def get_current_user(request: Request) -> dict:
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
-        payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
-        if payload.get("type") != "access":
-            raise HTTPException(status_code=401, detail="Invalid token type")
+        payload = decode_token(token)
         user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
@@ -103,6 +137,36 @@ def set_auth_cookie(response: Response, token: str) -> None:
     )
 
 
+# ─── Brute force lockout ───────────────────────────────────────────────────
+async def _is_locked(identifier: str) -> Optional[datetime]:
+    doc = await db.login_attempts.find_one({"identifier": identifier})
+    if not doc:
+        return None
+    locked_until = doc.get("locked_until")
+    if locked_until and locked_until > datetime.now(timezone.utc):
+        return locked_until
+    return None
+
+
+async def _record_login_failure(identifier: str) -> None:
+    now = datetime.now(timezone.utc)
+    doc = await db.login_attempts.find_one({"identifier": identifier})
+    count = (doc.get("count", 0) if doc else 0) + 1
+    update = {"count": count, "last_at": now}
+    if count >= LOGIN_MAX_FAILS:
+        update["locked_until"] = now + timedelta(minutes=LOGIN_LOCKOUT_MIN)
+        update["count"] = 0  # reset after lockout window; lockout itself enforces wait
+    await db.login_attempts.update_one(
+        {"identifier": identifier},
+        {"$set": update},
+        upsert=True,
+    )
+
+
+async def _clear_login_attempts(identifier: str) -> None:
+    await db.login_attempts.delete_one({"identifier": identifier})
+
+
 # ─── Pydantic Models ───────────────────────────────────────────────────────
 class RegisterIn(BaseModel):
     email: EmailStr
@@ -118,6 +182,10 @@ class LoginIn(BaseModel):
 class UpdateProfileIn(BaseModel):
     name: Optional[str] = None
     phone: Optional[str] = None
+
+
+class PublicKeyIn(BaseModel):
+    publicKey: str = Field(min_length=10, max_length=128)
 
 
 class FriendRequestIn(BaseModel):
@@ -136,11 +204,15 @@ class JoinRoomIn(BaseModel):
     inviteCode: str = Field(min_length=3, max_length=64)
 
 
+class EncryptedSlice(BaseModel):
+    ciphertext: str
+    nonce: str
+
+
 class SendMessageIn(BaseModel):
     roomId: str
-    ciphertext: str
-    iv: str
-    salt: str
+    encryptedFor: Dict[str, EncryptedSlice]
+    senderPubKey: str
     ephemeral: bool = False
 
 
@@ -157,11 +229,13 @@ async def register(payload: RegisterIn, response: Response):
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
 
+    public_key = derive_pubkey_b64(email, payload.password)
     doc = {
         "email": email,
         "password_hash": hash_password(payload.password),
         "name": payload.name.strip(),
         "phone": None,
+        "public_key": public_key,
         "role": "user",
         "created_at": datetime.now(timezone.utc),
     }
@@ -174,11 +248,25 @@ async def register(payload: RegisterIn, response: Response):
 
 
 @api.post("/auth/login")
-async def login(payload: LoginIn, response: Response):
+async def login(payload: LoginIn, request: Request, response: Response):
     email = payload.email.lower()
+    ip = request.client.host if request.client else "unknown"
+    identifier = f"{ip}:{email}"
+
+    locked_until = await _is_locked(identifier)
+    if locked_until:
+        wait = int((locked_until - datetime.now(timezone.utc)).total_seconds() // 60) + 1
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many failed attempts. Try again in ~{wait} min.",
+        )
+
     user = await db.users.find_one({"email": email})
     if not user or not verify_password(payload.password, user.get("password_hash", "")):
+        await _record_login_failure(identifier)
         raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    await _clear_login_attempts(identifier)
     token = create_access_token(str(user["_id"]), email)
     set_auth_cookie(response, token)
     return {"user": serialize_user(user), "access_token": token}
@@ -193,6 +281,15 @@ async def logout(response: Response, _user=Depends(get_current_user)):
 @api.get("/auth/me")
 async def me(user=Depends(get_current_user)):
     return {"user": serialize_user(user)}
+
+
+@api.put("/users/me/public-key")
+async def upload_pubkey(payload: PublicKeyIn, user=Depends(get_current_user)):
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"public_key": payload.publicKey}},
+    )
+    return {"ok": True}
 
 
 @api.patch("/users/me")
@@ -215,19 +312,22 @@ async def _user_brief(uid_str: str) -> dict:
     except Exception:
         u = None
     if not u:
-        return {"id": uid_str, "name": "Unknown", "email": None, "phone": None}
+        return {"id": uid_str, "name": "Unknown", "email": None, "phone": None, "publicKey": None}
     return {
         "id": str(u["_id"]),
         "name": u.get("name"),
         "email": u.get("email"),
         "phone": u.get("phone"),
+        "publicKey": u.get("public_key"),
     }
 
 
 @api.get("/friends/search")
 async def search_friends(q: str = Query(..., min_length=1), user=Depends(get_current_user)):
-    me_id = str(user["_id"])
-    regex = {"$regex": q, "$options": "i"}
+    safe = re.escape(q.strip())
+    if not safe:
+        return {"results": []}
+    regex = {"$regex": safe, "$options": "i"}
     cursor = db.users.find(
         {
             "$and": [
@@ -243,8 +343,8 @@ async def search_friends(q: str = Query(..., min_length=1), user=Depends(get_cur
             "name": u.get("name"),
             "email": u.get("email"),
             "phone": u.get("phone"),
+            "publicKey": u.get("public_key"),
         })
-    _ = me_id
     return {"results": results}
 
 
@@ -311,7 +411,6 @@ async def friend_accept(payload: FriendActionIn, user=Depends(get_current_user))
     if f["status"] != "pending":
         raise HTTPException(status_code=400, detail="Already handled")
     await db.friends.update_one({"_id": fid}, {"$set": {"status": "accepted"}})
-    # auto-create DM room
     await _get_or_create_dm_room(f["requesterId"], me_id)
     return {"ok": True}
 
@@ -364,7 +463,6 @@ async def _last_message(room_id: str) -> Optional[dict]:
 
 def _room_display_name(room: dict, me_id: str, others: dict) -> str:
     if room["type"] == "dm":
-        # name = the other member's name
         for m in room["members"]:
             if m != me_id:
                 return others.get(m, "Direct Message")
@@ -378,7 +476,6 @@ async def list_rooms(user=Depends(get_current_user)):
     cursor = db.rooms.find({"members": me_id}).sort("created_at", -1)
     rooms = []
     async for r in cursor:
-        # collect other-member display names for DMs
         others_map = {}
         if r["type"] == "dm":
             for m in r["members"]:
@@ -394,7 +491,6 @@ async def list_rooms(user=Depends(get_current_user)):
             "lastMessage": last,
             "createdAt": r["created_at"].isoformat(),
         })
-    # sort: rooms with last message most recent first, otherwise by created_at
     rooms.sort(key=lambda x: (x["lastMessage"]["createdAt"] if x["lastMessage"] else x["createdAt"]), reverse=True)
     return {"items": rooms}
 
@@ -456,6 +552,87 @@ async def join_room(payload: JoinRoomIn, user=Depends(get_current_user)):
     return {"id": str(r["_id"]), "alreadyMember": False}
 
 
+# ─── WebSocket connection manager ──────────────────────────────────────────
+class ConnectionManager:
+    def __init__(self) -> None:
+        self.connections: Dict[str, Set[WebSocket]] = {}
+        self.lock = asyncio.Lock()
+
+    async def connect(self, user_id: str, ws: WebSocket) -> None:
+        await ws.accept()
+        async with self.lock:
+            self.connections.setdefault(user_id, set()).add(ws)
+
+    async def disconnect(self, user_id: str, ws: WebSocket) -> None:
+        async with self.lock:
+            conns = self.connections.get(user_id)
+            if conns and ws in conns:
+                conns.remove(ws)
+                if not conns:
+                    self.connections.pop(user_id, None)
+
+    async def send_to_user(self, user_id: str, data: dict) -> None:
+        conns = list(self.connections.get(user_id, set()))
+        for ws in conns:
+            try:
+                await ws.send_text(json.dumps(data))
+            except Exception:
+                # silently drop; client will reconnect
+                pass
+
+
+manager = ConnectionManager()
+
+
+@app.websocket("/api/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=4401)
+        return
+    try:
+        payload = decode_token(token)
+        user_id = payload["sub"]
+    except Exception:
+        await websocket.close(code=4401)
+        return
+
+    await manager.connect(user_id, websocket)
+    try:
+        # send hello
+        await websocket.send_text(json.dumps({"type": "hello", "userId": user_id}))
+        while True:
+            # client may send keepalives; we just discard them
+            msg = await websocket.receive_text()
+            try:
+                parsed = json.loads(msg)
+                if parsed.get("type") == "ping":
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+            except Exception:
+                pass
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await manager.disconnect(user_id, websocket)
+
+
+def _build_message_for(viewer_id: str, doc: dict, sender_name: str) -> dict:
+    """Slice a stored message for a particular recipient."""
+    encrypted_for = doc.get("encryptedFor", {})
+    slice_ = encrypted_for.get(viewer_id) or {"ciphertext": "", "nonce": ""}
+    return {
+        "id": str(doc["_id"]),
+        "roomId": doc["roomId"],
+        "senderId": doc["senderId"],
+        "senderName": sender_name,
+        "senderPubKey": doc.get("senderPubKey"),
+        "ciphertext": slice_["ciphertext"],
+        "nonce": slice_["nonce"],
+        "ephemeral": doc.get("ephemeral", False),
+        "createdAt": doc["created_at"].isoformat(),
+    }
+
+
 # ─── Messages ──────────────────────────────────────────────────────────────
 @api.get("/messages")
 async def list_messages(roomId: str, limit: int = 100, user=Depends(get_current_user)):
@@ -468,24 +645,14 @@ async def list_messages(roomId: str, limit: int = 100, user=Depends(get_current_
     if not r or me_id not in r["members"]:
         raise HTTPException(status_code=404, detail="Room not found")
 
-    # purge expired ephemeral messages
     now = datetime.now(timezone.utc)
     await db.messages.delete_many({"roomId": roomId, "expiresAt": {"$lte": now}})
 
     cursor = db.messages.find({"roomId": roomId}).sort("created_at", 1).limit(limit)
     items = []
     async for m in cursor:
-        items.append({
-            "id": str(m["_id"]),
-            "roomId": m["roomId"],
-            "senderId": m["senderId"],
-            "senderName": (await _user_brief(m["senderId"]))["name"],
-            "ciphertext": m["ciphertext"],
-            "iv": m["iv"],
-            "salt": m["salt"],
-            "ephemeral": m.get("ephemeral", False),
-            "createdAt": m["created_at"].isoformat(),
-        })
+        sender_name = (await _user_brief(m["senderId"]))["name"]
+        items.append(_build_message_for(me_id, m, sender_name))
     return {"items": items}
 
 
@@ -500,30 +667,46 @@ async def send_message(payload: SendMessageIn, user=Depends(get_current_user)):
     if not r or me_id not in r["members"]:
         raise HTTPException(status_code=404, detail="Room not found")
 
+    member_set = set(r["members"])
+    encrypted_for = {k: v.dict() for k, v in payload.encryptedFor.items() if k in member_set}
+    if me_id not in encrypted_for:
+        raise HTTPException(
+            status_code=400,
+            detail="encryptedFor must include a slice for the sender",
+        )
+    if not all(k in encrypted_for for k in member_set):
+        # Missing slice for one or more members (their pubkey may not be available).
+        # Deliver to only those we have slices for; others won't be able to read this message.
+        # We just log and continue.
+        missing = member_set - encrypted_for.keys()
+        logger.info("send_message: room=%s missing slices for %s", payload.roomId, missing)
+
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(minutes=2) if payload.ephemeral else None
     doc = {
         "roomId": payload.roomId,
         "senderId": me_id,
-        "ciphertext": payload.ciphertext,
-        "iv": payload.iv,
-        "salt": payload.salt,
+        "senderPubKey": payload.senderPubKey,
+        "encryptedFor": encrypted_for,
         "ephemeral": payload.ephemeral,
         "expiresAt": expires_at,
         "created_at": now,
     }
     res = await db.messages.insert_one(doc)
-    return {
-        "id": str(res.inserted_id),
-        "roomId": payload.roomId,
-        "senderId": me_id,
-        "senderName": user.get("name"),
-        "ciphertext": payload.ciphertext,
-        "iv": payload.iv,
-        "salt": payload.salt,
-        "ephemeral": payload.ephemeral,
-        "createdAt": now.isoformat(),
-    }
+    doc["_id"] = res.inserted_id
+
+    sender_name = user.get("name") or "Unknown"
+
+    # Broadcast over WebSocket to every room member that has an active connection
+    for member_id in member_set:
+        try:
+            slice_msg = _build_message_for(member_id, doc, sender_name)
+            await manager.send_to_user(member_id, {"type": "message", "data": slice_msg})
+        except Exception as e:
+            logger.warning("ws broadcast error for %s: %s", member_id, e)
+
+    # Echo back the sender's slice for the HTTP response
+    return _build_message_for(me_id, doc, sender_name)
 
 
 # ─── Health ────────────────────────────────────────────────────────────────
@@ -537,7 +720,7 @@ app.include_router(api)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,  # Bearer-token mode for mobile; cookies still work cross-origin without credentials
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -553,8 +736,15 @@ async def _seed_demo() -> None:
     ids: dict[str, str] = {}
     for u in demo_users:
         email = u["email"].lower()
+        public_key = derive_pubkey_b64(email, u["password"])
         existing = await db.users.find_one({"email": email})
         if existing:
+            # Ensure public key is set/up-to-date
+            if existing.get("public_key") != public_key:
+                await db.users.update_one(
+                    {"_id": existing["_id"]},
+                    {"$set": {"public_key": public_key}},
+                )
             ids[email] = str(existing["_id"])
             continue
         doc = {
@@ -562,6 +752,7 @@ async def _seed_demo() -> None:
             "password_hash": hash_password(u["password"]),
             "name": u["name"],
             "phone": u["phone"],
+            "public_key": public_key,
             "role": "user",
             "created_at": datetime.now(timezone.utc),
         }
@@ -571,6 +762,7 @@ async def _seed_demo() -> None:
     # admin
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@silent.app").lower()
     admin_password = os.environ.get("ADMIN_PASSWORD", "admin12345")
+    admin_pk = derive_pubkey_b64(admin_email, admin_password)
     admin = await db.users.find_one({"email": admin_email})
     if admin is None:
         doc = {
@@ -578,21 +770,22 @@ async def _seed_demo() -> None:
             "password_hash": hash_password(admin_password),
             "name": "Admin",
             "phone": None,
+            "public_key": admin_pk,
             "role": "admin",
             "created_at": datetime.now(timezone.utc),
         }
         res = await db.users.insert_one(doc)
         ids[admin_email] = str(res.inserted_id)
-    elif not verify_password(admin_password, admin.get("password_hash", "")):
-        await db.users.update_one(
-            {"_id": admin["_id"]},
-            {"$set": {"password_hash": hash_password(admin_password)}},
-        )
-        ids[admin_email] = str(admin["_id"])
     else:
+        if not verify_password(admin_password, admin.get("password_hash", "")):
+            await db.users.update_one(
+                {"_id": admin["_id"]},
+                {"$set": {"password_hash": hash_password(admin_password), "public_key": admin_pk}},
+            )
+        elif admin.get("public_key") != admin_pk:
+            await db.users.update_one({"_id": admin["_id"]}, {"$set": {"public_key": admin_pk}})
         ids[admin_email] = str(admin["_id"])
 
-    # friendships: alex<->maya accepted, alex<->jordan accepted, maya->jordan pending
     pairs = [
         (ids["alex@silent.app"], ids["maya@silent.app"], "accepted"),
         (ids["alex@silent.app"], ids["jordan@silent.app"], "accepted"),
@@ -613,12 +806,10 @@ async def _seed_demo() -> None:
                 "created_at": datetime.now(timezone.utc),
             })
 
-    # DM rooms for accepted friendships
     for a, b, status in pairs:
         if status == "accepted":
             await _get_or_create_dm_room(a, b)
 
-    # Group room "Privacy Circle" with all 3 demo users
     group = await db.rooms.find_one({"type": "group", "name": "Privacy Circle"})
     if not group:
         code = "circle2026"
@@ -640,8 +831,16 @@ async def on_startup():
     await db.rooms.create_index("members")
     await db.messages.create_index([("roomId", 1), ("created_at", 1)])
     await db.messages.create_index("expiresAt", expireAfterSeconds=0)
+    await db.login_attempts.create_index("identifier", unique=True)
+
+    # One-shot migration: drop legacy messages with old schema (had `ciphertext` field at root level).
+    # New schema stores `encryptedFor` map.
+    legacy = await db.messages.delete_many({"ciphertext": {"$exists": True}})
+    if legacy.deleted_count:
+        logger.info("Dropped %d legacy messages (old encryption schema)", legacy.deleted_count)
+
     await _seed_demo()
-    logger.info("Silent Signal API ready")
+    logger.info("Silent Signal API ready (E2E NaCl + WebSocket)")
 
 
 @app.on_event("shutdown")

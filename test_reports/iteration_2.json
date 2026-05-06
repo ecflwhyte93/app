@@ -1,0 +1,56 @@
+{
+  "summary": "Iteration 2 testing of Silent Signal: WebSockets + per-user NaCl encryption + brute-force lockout + regex escape. 18/20 backend tests pass. Frontend mobile flow (login → /chats → DM with Maya → send + decrypt → NACL/LIVE badges) verified end-to-end. Two failures found: (1) brute-force lockout does not trigger behind the multi-pod ingress because lockout key includes client IP and the preview proxy alternates between two IPs (10.79.131.92 / 10.79.131.93), so attempts are split across two records and never reach the 5-fail threshold; (2) a stale orphan user in 'Privacy Circle' (created by iteration 1's join-with-invite test before pubkey backfill existed) has no publicKey — cleaned up during this run.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "POST /api/auth/login",
+        "issue": "Brute-force lockout uses `{request.client.host}:{email}` as the key, but behind the K8s ingress request.client.host alternates between multiple proxy IPs. As a result an attacker hitting the public preview URL effectively gets 5×N attempts instead of 5. Either (a) honor X-Forwarded-For (first hop) and use the real client IP, or (b) drop the IP component and key by email only with a longer lockout/exponential backoff. Reproduced repeatedly: 5 wrong passwords succeed at 401, the 6th wrong attempt also returns 401 instead of 429.",
+        "priority": "HIGH"
+      }
+    ],
+    "minor": [
+      {
+        "endpoint": "WebSocket /api/ws",
+        "issue": "Bad/missing token rejects with HTTP 403 (Starlette default when close() is called before accept()) rather than a WS close code 4401. Functionally equivalent (connection refused), but if the spec requires 4401 close code, accept() the socket first then close(code=4401)."
+      },
+      {
+        "endpoint": "/api/messages",
+        "issue": "When some room members do not have a publicKey, server silently drops them from delivery (logs only). Consider returning a 207-style summary or warning so the client knows recipients were skipped."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": [
+      {"component": "global", "issue": "Console warning persists: 'props.pointerEvents is deprecated. Use style.pointerEvents'. Coming from a 3rd-party RN-web shim, non-blocking."}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_silent_signal.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "FIX (HIGH): Make the login lockout multi-proxy aware. Read X-Forwarded-For (first IP) for the lockout key, OR key by email only. Without this, the 5/15min lockout requirement is not enforced behind the preview ingress.",
+    "(Optional) Change WebSocket auth-fail path to `await ws.accept(); await ws.close(code=4401)` so clients see WS close code 4401 instead of HTTP 403.",
+    "(Optional, cosmetic) Suppress 'props.pointerEvents is deprecated' RN-web warning."
+  ],
+  "critical_code_review_comments": [
+    "server.py is ~850 lines now — still maintainable but consider splitting into routers (auth, friends, rooms, messages, ws) before the next iteration.",
+    "WebSocket broadcast uses asyncio.Lock around the connection set but iterates conns without holding it; that's fine since list(...) snapshots, but be aware of concurrent disconnect during iteration.",
+    "encryptedFor map is filtered by member_set on POST — good (prevents writing slices to non-members).",
+    "Server returns the requester's slice on GET — verified with cross-user test that maya sees a different ciphertext than alex for the same message and decrypts to the same plaintext.",
+    "re.escape applied before $regex — verified with `.*`, `+155`, `[a-z]`, `(`, `*`, `\\`, `.` — none cause a 500.",
+    "Public key derivation on the seed uses sha256(email:password:domain) → matches client; tested by deriving Maya's secret from her password and decrypting alex's message slice for Maya."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_silent_signal.py (rewrote for NaCl schema, lockout, search escape, ws)"
+  ],
+  "success_rate": {"backend": "90% (18/20)", "frontend": "100% on the validated flows (landing/login/chat/send+decrypt/NACL+LIVE badges)"},
+  "seed_data_creation": "Tests created a few short-lived TEST_/lockout_/test_ users via /api/auth/register. Cleaned up 2 orphan users (no pubkey) from Privacy Circle membership and cleared login_attempts collection at end of run.",
+  "retest_needed": true,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Backend at https://bug-squash-30.preview.emergentagent.com/api ; WSS at wss://bug-squash-30.preview.emergentagent.com/api/ws?token=...  Demo creds alex/maya/jordan @silent.app / demo1234. Pytest suite at /app/backend/tests/test_silent_signal.py covers PUT /users/me/public-key, lockout, regex escape, room members pubkey, message encryption per-recipient + sender-slice 400, WS hello/ping-pong/bad-token/broadcast. Two known failures: (1) IP-based lockout fails behind multi-pod ingress (real bug, see action_items); (2) orphan no-pubkey member in Privacy Circle (cleaned up this run, will not recur for fresh installs).",
+  "rca_of_issue": "Lockout failure RCA: backend uses `f'{request.client.host}:{email}'` (server.py:254). Logs show two distinct ingress IPs (10.79.131.92, 10.79.131.93) load-balancing. Each fail increments only one of two counters; neither reaches LOGIN_MAX_FAILS=5 within 5 attempts. Mitigation: parse X-Forwarded-For header — `ip = (request.headers.get('x-forwarded-for') or request.client.host).split(',')[0].strip()` — or remove IP from key. Verified: when running tests against http://localhost:8001 directly (single host), the lockout fires correctly on the 5th fail."
+}

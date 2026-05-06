@@ -17,17 +17,32 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import * as Clipboard from "expo-clipboard";
 import { useAuth } from "../../src/context/AuthContext";
 import { api } from "../../src/lib/api";
-import { encryptMessage, decryptMessage } from "../../src/lib/encryption";
+import {
+  encryptForRecipient,
+  decryptFromSender,
+  publicKeyFromB64,
+  publicKeyToB64,
+} from "../../src/lib/encryption";
+import { keystore } from "../../src/lib/keystore";
+import { openWS, type WSConnection } from "../../src/lib/ws";
 import { C, R, SP } from "../../src/theme";
+
+type Member = {
+  id: string;
+  name: string;
+  email: string;
+  phone: string | null;
+  publicKey: string | null;
+};
 
 type Message = {
   id: string;
   roomId: string;
   senderId: string;
   senderName: string;
+  senderPubKey: string | null;
   ciphertext: string;
-  iv: string;
-  salt: string;
+  nonce: string;
   ephemeral: boolean;
   createdAt: string;
 };
@@ -37,7 +52,7 @@ type Room = {
   name: string;
   type: "dm" | "group";
   inviteCode: string | null;
-  members: { id: string; name: string }[];
+  members: Member[];
 };
 
 function formatTime(iso: string) {
@@ -60,7 +75,9 @@ export default function ChatScreen() {
   const [ephemeral, setEphemeral] = useState(false);
   const [sending, setSending] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [wsLive, setWsLive] = useState(false);
   const listRef = useRef<FlatList<Message>>(null);
+  const wsRef = useRef<WSConnection | null>(null);
 
   const loadRoom = useCallback(async () => {
     try {
@@ -75,10 +92,17 @@ export default function ChatScreen() {
   const loadMessages = useCallback(async () => {
     try {
       const data = await api<{ items: Message[] }>(`/messages?roomId=${roomId}&limit=200`);
-      setMessages(data.items);
+      // Merge: keep optimistic IDs, replace duplicates from server
+      setMessages((prev) => {
+        const byId = new Map<string, Message>();
+        for (const m of data.items) byId.set(m.id, m);
+        for (const m of prev) if (m.id.startsWith("tmp-") && !byId.has(m.id)) byId.set(m.id, m);
+        return Array.from(byId.values()).sort((a, b) =>
+          a.createdAt.localeCompare(b.createdAt)
+        );
+      });
       setLoading(false);
-    } catch (e: any) {
-      console.warn("messages", e?.message);
+    } catch {
       setLoading(false);
     }
   }, [roomId]);
@@ -88,29 +112,87 @@ export default function ChatScreen() {
     loadMessages();
   }, [loadRoom, loadMessages]);
 
+  // Polling fallback (every 8s — slow because WS handles real-time)
   useEffect(() => {
-    const t = setInterval(loadMessages, 3000);
+    const t = setInterval(loadMessages, 8000);
     return () => clearInterval(t);
   }, [loadMessages]);
 
-  // Decrypt new messages
+  // WebSocket for instant delivery
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const updates: Record<string, string> = {};
-      for (const m of messages) {
-        if (!decrypted[m.id]) {
-          updates[m.id] = await decryptMessage(m.ciphertext, m.iv, m.salt);
+      const conn = await openWS((ev) => {
+        if (ev.type === "hello") {
+          if (!cancelled) setWsLive(true);
+          return;
         }
-      }
-      if (!cancelled && Object.keys(updates).length > 0) {
-        setDecrypted((prev) => ({ ...prev, ...updates }));
+        if (ev.type === "message") {
+          const m: Message = ev.data;
+          if (!m || m.roomId !== roomId) return;
+          setMessages((prev) => {
+            // Replace optimistic by created_at + senderId fingerprint, or skip if id exists
+            if (prev.some((x) => x.id === m.id)) return prev;
+            const withoutOptimistic = prev.filter(
+              (x) =>
+                !(
+                  x.id.startsWith("tmp-") &&
+                  x.senderId === m.senderId &&
+                  Math.abs(
+                    new Date(x.createdAt).getTime() - new Date(m.createdAt).getTime()
+                  ) < 5000
+                )
+            );
+            return [...withoutOptimistic, m].sort((a, b) =>
+              a.createdAt.localeCompare(b.createdAt)
+            );
+          });
+        }
+      });
+      if (cancelled) {
+        conn?.close();
+      } else {
+        wsRef.current = conn;
       }
     })();
     return () => {
       cancelled = true;
+      wsRef.current?.close();
+      wsRef.current = null;
+      setWsLive(false);
     };
-  }, [messages, decrypted]);
+  }, [roomId]);
+
+  // Decrypt every message when we have keypair + room context
+  useEffect(() => {
+    const kp = keystore.get();
+    if (!kp || !room) return;
+    const memberById = new Map<string, Member>();
+    for (const m of room.members) memberById.set(m.id, m);
+
+    const updates: Record<string, string> = {};
+    for (const msg of messages) {
+      if (decrypted[msg.id]) continue;
+      // For optimistic local messages we may have already set decrypted text
+      if (!msg.ciphertext || !msg.nonce) continue;
+      const senderPk = msg.senderPubKey
+        ? msg.senderPubKey
+        : memberById.get(msg.senderId)?.publicKey || null;
+      if (!senderPk) {
+        updates[msg.id] = "[no sender key]";
+        continue;
+      }
+      const out = decryptFromSender(
+        { ciphertext: msg.ciphertext, nonce: msg.nonce },
+        publicKeyFromB64(senderPk),
+        kp.secretKey
+      );
+      updates[msg.id] = out ?? "[unable to decrypt]";
+    }
+    if (Object.keys(updates).length) {
+      setDecrypted((prev) => ({ ...prev, ...updates }));
+    }
+  }, [messages, room, decrypted]);
 
   // Auto-scroll
   useEffect(() => {
@@ -121,37 +203,72 @@ export default function ChatScreen() {
 
   const send = async () => {
     if (!text.trim() || sending) return;
+    const kp = keystore.get();
+    if (!kp || !room || !user) {
+      Alert.alert("Not ready", "Encryption keys not loaded — please re-login.");
+      return;
+    }
     setSending(true);
     try {
-      const enc = await encryptMessage(text.trim());
+      // Encrypt for every member that has a public key (including ourselves)
+      const encryptedFor: Record<string, { ciphertext: string; nonce: string }> = {};
+      let missing = 0;
+      for (const member of room.members) {
+        if (!member.publicKey) {
+          missing += 1;
+          continue;
+        }
+        encryptedFor[member.id] = encryptForRecipient(
+          text.trim(),
+          publicKeyFromB64(member.publicKey),
+          kp.secretKey
+        );
+      }
+      // Ensure my slice exists (member should always include me, but guard)
+      if (!encryptedFor[user.id]) {
+        encryptedFor[user.id] = encryptForRecipient(text.trim(), kp.publicKey, kp.secretKey);
+      }
+
       const optimistic: Message = {
         id: `tmp-${Date.now()}`,
         roomId,
-        senderId: user!.id,
-        senderName: user!.name,
-        ciphertext: enc.ciphertext,
-        iv: enc.iv,
-        salt: enc.salt,
+        senderId: user.id,
+        senderName: user.name,
+        senderPubKey: publicKeyToB64(kp.publicKey),
+        ciphertext: encryptedFor[user.id].ciphertext,
+        nonce: encryptedFor[user.id].nonce,
         ephemeral,
         createdAt: new Date().toISOString(),
       };
       setMessages((prev) => [...prev, optimistic]);
       setDecrypted((prev) => ({ ...prev, [optimistic.id]: text.trim() }));
-      const saved = text.trim();
+      const draft = text.trim();
       setText("");
-      await api<Message>("/messages", {
-        method: "POST",
-        body: {
-          roomId,
-          ciphertext: enc.ciphertext,
-          iv: enc.iv,
-          salt: enc.salt,
-          ephemeral,
-        },
-      });
-      // Real fetch will overwrite optimistic
-      void saved;
-      loadMessages();
+
+      try {
+        await api<Message>("/messages", {
+          method: "POST",
+          body: {
+            roomId,
+            encryptedFor,
+            senderPubKey: publicKeyToB64(kp.publicKey),
+            ephemeral,
+          },
+        });
+      } catch (e) {
+        // Restore the input on failure
+        setText(draft);
+        // Remove the optimistic message
+        setMessages((prev) => prev.filter((x) => x.id !== optimistic.id));
+        throw e;
+      }
+
+      if (missing > 0) {
+        Alert.alert(
+          "Heads up",
+          `${missing} room member(s) haven't logged in yet — they'll see your message after they log in.`
+        );
+      }
     } catch (e: any) {
       Alert.alert("Failed to send", e?.message || "Try again");
     } finally {
@@ -194,8 +311,12 @@ export default function ChatScreen() {
             <Feather name="lock" size={10} color={C.primary} />
             <Text style={styles.headerSub}>
               {room?.type === "group"
-                ? `${room.members?.length || 0} members · ENCRYPTED`
-                : "END-TO-END ENCRYPTED"}
+                ? `${room.members?.length || 0} MEMBERS · NACL E2E`
+                : "END-TO-END · NACL"}
+            </Text>
+            <View style={[styles.liveDot, wsLive && styles.liveDotOn]} />
+            <Text style={[styles.liveText, wsLive && { color: C.primary }]}>
+              {wsLive ? "LIVE" : "POLLING"}
             </Text>
           </View>
         </View>
@@ -219,7 +340,6 @@ export default function ChatScreen() {
         behavior={Platform.OS === "ios" ? "padding" : undefined}
         keyboardVerticalOffset={Platform.OS === "ios" ? 0 : 20}
       >
-        {/* Messages */}
         {loading ? (
           <View style={styles.center}>
             <ActivityIndicator color={C.primary} />
@@ -231,7 +351,8 @@ export default function ChatScreen() {
             </View>
             <Text style={styles.emptyTitle}>Conversation starts here</Text>
             <Text style={styles.emptyDesc}>
-              Messages are encrypted on your device. The server only stores ciphertext.
+              Each message is encrypted on your device with the recipient's public key. The
+              server only sees ciphertext.
             </Text>
           </View>
         ) : (
@@ -242,7 +363,7 @@ export default function ChatScreen() {
             contentContainerStyle={styles.messages}
             renderItem={({ item }) => {
               const isOwn = item.senderId === user?.id;
-              const text = decrypted[item.id] ?? "[decrypting…]";
+              const txt = decrypted[item.id] ?? "[decrypting…]";
               return (
                 <View
                   style={[styles.bubbleWrap, isOwn ? styles.bubbleOwn : styles.bubbleOther]}
@@ -263,7 +384,7 @@ export default function ChatScreen() {
                         <Text style={styles.vanishText}>VANISHING · 2 MIN</Text>
                       </View>
                     )}
-                    <Text style={styles.bubbleText}>{text}</Text>
+                    <Text style={styles.bubbleText}>{txt}</Text>
                   </View>
                   <View style={[styles.metaRow, isOwn ? { alignSelf: "flex-end" } : null]}>
                     <Text style={styles.timeText}>{formatTime(item.createdAt)}</Text>
@@ -360,6 +481,20 @@ const styles = StyleSheet.create({
   headerName: { color: C.text, fontSize: 15, fontWeight: "600" },
   headerSubRow: { flexDirection: "row", alignItems: "center", gap: 4, marginTop: 2 },
   headerSub: { color: C.primary, fontSize: 10, fontFamily: "monospace", letterSpacing: 1 },
+  liveDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: C.muted,
+    marginLeft: 6,
+  },
+  liveDotOn: { backgroundColor: C.primary },
+  liveText: {
+    color: C.muted,
+    fontSize: 9,
+    fontFamily: "monospace",
+    letterSpacing: 1,
+  },
   copyHeaderBtn: {
     flexDirection: "row",
     alignItems: "center",

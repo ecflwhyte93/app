@@ -1,3 +1,7 @@
+// IMPORTANT: Polyfill must be the first import — required for tweetnacl on
+// React Native to use a CSPRNG via expo-crypto / native modules.
+import "react-native-get-random-values";
+
 import { Stack } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import { SafeAreaProvider } from "react-native-safe-area-context";

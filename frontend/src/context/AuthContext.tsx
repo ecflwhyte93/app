@@ -1,11 +1,14 @@
 import React, { createContext, useContext, useEffect, useState, useCallback } from "react";
 import { api, tokenStorage } from "../lib/api";
+import { deriveKeyPair, publicKeyToB64 } from "../lib/encryption";
+import { keystore } from "../lib/keystore";
 
 export type SSUser = {
   id: string;
   email: string;
   name: string;
   phone: string | null;
+  publicKey: string | null;
   role: string;
 };
 
@@ -20,6 +23,17 @@ type AuthState = {
 
 const Ctx = createContext<AuthState | null>(null);
 
+const PASSWORD_CACHE_KEY = "silent_signal_pw_cache";
+
+// We keep a tiny in-memory cache of the user's password between mount/unmount
+// of the app session so that resuming the session (token still valid) can
+// re-derive the keypair without prompting. This lives only in-memory — never
+// persisted to disk.
+const sessionPwCache: { email: string | null; password: string | null } = {
+  email: null,
+  password: null,
+};
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<SSUser | null>(null);
   const [loading, setLoading] = useState(true);
@@ -33,6 +47,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
       const data = await api<{ user: SSUser }>("/auth/me");
       setUser(data.user);
+      // If we have a cached password from this session, restore the keypair
+      if (
+        sessionPwCache.email &&
+        sessionPwCache.password &&
+        sessionPwCache.email === data.user.email
+      ) {
+        const kp = deriveKeyPair(sessionPwCache.email, sessionPwCache.password);
+        keystore.set(kp);
+      }
     } catch {
       setUser(null);
       await tokenStorage.clear();
@@ -46,15 +69,42 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     })();
   }, [refresh]);
 
-  const login = useCallback(async (email: string, password: string) => {
-    const data = await api<{ user: SSUser; access_token: string }>("/auth/login", {
-      method: "POST",
-      body: { email, password },
-      auth: false,
-    });
-    await tokenStorage.set(data.access_token);
-    setUser(data.user);
+  const ensureKeypair = useCallback(async (email: string, password: string) => {
+    const kp = deriveKeyPair(email, password);
+    keystore.set(kp);
+    sessionPwCache.email = email;
+    sessionPwCache.password = password;
+    // Make sure the server has our pubkey (idempotent)
+    try {
+      await api("/users/me/public-key", {
+        method: "PUT",
+        body: { publicKey: publicKeyToB64(kp.publicKey) },
+      });
+    } catch {
+      /* non-fatal */
+    }
+    void PASSWORD_CACHE_KEY;
   }, []);
+
+  const login = useCallback(
+    async (email: string, password: string) => {
+      const data = await api<{ user: SSUser; access_token: string }>("/auth/login", {
+        method: "POST",
+        body: { email, password },
+        auth: false,
+      });
+      await tokenStorage.set(data.access_token);
+      await ensureKeypair(email.toLowerCase(), password);
+      // Fetch user again so publicKey field reflects the upload
+      try {
+        const me = await api<{ user: SSUser }>("/auth/me");
+        setUser(me.user);
+      } catch {
+        setUser(data.user);
+      }
+    },
+    [ensureKeypair]
+  );
 
   const register = useCallback(
     async (email: string, password: string, name: string) => {
@@ -64,9 +114,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         auth: false,
       });
       await tokenStorage.set(data.access_token);
-      setUser(data.user);
+      await ensureKeypair(email.toLowerCase(), password);
+      try {
+        const me = await api<{ user: SSUser }>("/auth/me");
+        setUser(me.user);
+      } catch {
+        setUser(data.user);
+      }
     },
-    []
+    [ensureKeypair]
   );
 
   const logout = useCallback(async () => {
@@ -76,6 +132,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       /* ignore */
     }
     await tokenStorage.clear();
+    keystore.clear();
+    sessionPwCache.email = null;
+    sessionPwCache.password = null;
     setUser(null);
   }, []);
 
